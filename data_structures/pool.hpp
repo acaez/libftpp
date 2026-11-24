@@ -9,163 +9,180 @@
 # include <utility>
 # include <vector>
 
-template <typename TType>
+// ============================================================================================= //
 
+template <typename TType>
 class Pool
 {
 	private:
+		static_assert(alignof(TType) <= alignof(std::max_align_t),
+			"Pool: over-aligned types are not supported");
+
 		union Slot
 		{
 			Slot							*next;
 			alignas(TType) unsigned char	storage[sizeof(TType)];
 		};
 
+		std::vector<Slot *>	blocks;
+		Slot				*freeList;
+		std::size_t			usedCount;
+
 	public:
-		static const std::size_t    slt = 32;
+		static const std::size_t	slt = 32;
 
 		class Object
 		{
-            private:
-                Pool<TType> *pool;
-                TType       *ptr;
+			private:
+				Pool<TType>	*pool;
+				TType		*ptr;
+
 				friend class Pool<TType>;
-                Object(Pool<TType> *pool, TType *ptr) : pool(pool), ptr(ptr) {}
-                
-                void    reset()
-                {
-                    if (ptr != NULL)
-                    {
-                        ptr->~TType();
-                        pool->release(ptr);
-                        pool = NULL;
-                        ptr = NULL;
-                    }
-                }
-                
-                void    swap(Object &other) noexcept
-                { 
-                    std::swap(pool, other.pool);
-                    std::swap(ptr, other.ptr);
-                }
+
+				Object(Pool<TType> *pool, TType *ptr) : pool(pool), ptr(ptr) {}
+
+				void	reset()
+				{
+					if (ptr != NULL)
+					{
+						ptr->~TType();
+						pool->release(ptr);
+						pool = NULL;
+						ptr = NULL;
+					}
+				}
+
+				void	swap(Object &other) noexcept
+				{
+					std::swap(pool, other.pool);
+					std::swap(ptr, other.ptr);
+				}
 
 			public:
-                Object() : pool(NULL), ptr(NULL) {}
+				Object() : pool(NULL), ptr(NULL) {}
 				Object(const Object &) = delete;
 				Object	&operator=(const Object &) = delete;
 				~Object() { reset(); }
 
-                Object(Object &&other) noexcept : pool(NULL), ptr(NULL) { swap(other); }
+				Object(Object &&other) noexcept : pool(NULL), ptr(NULL) { swap(other); }
 
 				Object	&operator=(Object &&other) noexcept
 				{
-                    Object tmp(std::move(other));
-                    swap(tmp);
-                    return (*this);
-                }
+					Object	tmp(std::move(other));
+
+					swap(tmp);
+					return (*this);
+				}
 
 				TType	*operator->() const { return (ptr); }
 				TType	&operator*() const { return (*ptr); }
+				explicit operator bool() const { return (ptr != NULL); }
+		};
 
+// ============================================================================================= //
 
- // =============================================================================================== //
-		
-        Pool() : _freeList(NULL), _used(0) {}
+		Pool() : freeList(NULL), usedCount(0) {}
 
-		explicit Pool(const std::size_t &p_size) : _freeList(NULL), _used(0)
+		explicit Pool(const std::size_t &size) : freeList(NULL), usedCount(0)
 		{
-			resize(p_size);
+			resize(size);
 		}
 
 		~Pool()
 		{
-			if (_used != 0)
+			std::size_t	i;
+
+			if (usedCount != 0)
 			{
-				std::cerr << "Pool: destroyed while " << _used
+				std::cerr << "Pool: destroyed while " << usedCount
 					<< " object(s) still in use" << std::endl;
 				std::abort();
 			}
-			for (std::size_t i = 0; i < _blocks.size(); ++i)
-				::operator delete(_blocks[i]);
+			i = 0;
+			while (i < blocks.size())
+			{
+				::operator delete(blocks[i]);
+				i++;
+			}
 		}
 
-		// Les Object gardent un pointeur vers leur Pool : ni copie ni
-		// deplacement, sinon ce pointeur deviendrait invalide.
 		Pool(const Pool &) = delete;
 		Pool	&operator=(const Pool &) = delete;
 
-		// Garantit au moins p_size emplacements au total, en ajoutant des
-		// blocs. Ne retire jamais de bloc.
-		void	resize(const std::size_t &p_size)
-		{
-			if (p_size < _used)
-				throw std::invalid_argument(
-					"Pool::resize: size is lower than the number of objects in use");
-			while (capacity() < p_size)
-				_addBlock();
-		}
-
-		// Construit un TType dans un emplacement libre. Ajoute un bloc si le
-		// Pool est plein.
-		template <typename... TArgs>
-		Object	acquire(TArgs &&... p_args)
-		{
-			if (_freeList == NULL)
-				_addBlock();
-
-			Slot	*slot = _freeList;
-			Slot	*next = slot->next;
-			// Si le constructeur de TType leve une exception, la free list
-			// n'a pas encore ete modifiee : rien a annuler.
-			TType	*ptr = new (static_cast<void *>(slot->storage))
-				TType(std::forward<TArgs>(p_args)...);
-			_freeList = next;
-			++_used;
-			return (Object(this, ptr));
-		}
-
-		std::size_t	capacity() const { return (_blocks.size() * BLOCK_SIZE); }
-		std::size_t	used() const { return (_used); }
-		std::size_t	available() const { return (capacity() - _used); }
+// ============================================================================================= //
 
 	private:
-		// Alloue un bloc brut (aucun TType construit) et chaine ses cases en
-		// tete de la free list.
-		void	_addBlock()
+		void	addBlock()
 		{
-			Slot	*block = static_cast<Slot *>(
-				::operator new(BLOCK_SIZE * sizeof(Slot)));
+			Slot		*block;
+			std::size_t	i;
 
+			block = static_cast<Slot *>(::operator new(slt * sizeof(Slot)));
 			try
 			{
-				_blocks.push_back(block);
+				blocks.push_back(block);
 			}
 			catch (...)
 			{
 				::operator delete(block);
 				throw ;
 			}
-			for (std::size_t i = 0; i < BLOCK_SIZE - 1; ++i)
+			i = 0;
+			while (i < slt - 1)
+			{
 				block[i].next = &block[i + 1];
-			block[BLOCK_SIZE - 1].next = _freeList;
-			_freeList = block;
+				i++;
+			}
+			block[slt - 1].next = freeList;
+			freeList = block;
 		}
 
-		// Remet un emplacement (objet deja detruit) en tete de la free list.
-		void	_release(TType *p_ptr)
+	public:
+		void	resize(const std::size_t &size)
 		{
-			Slot	*slot = reinterpret_cast<Slot *>(p_ptr);
-
-			slot->next = _freeList;
-			_freeList = slot;
-			--_used;
+			if (size < usedCount)
+				throw std::invalid_argument("Pool::resize: size is lower than the number of objects");
+			while (capacity() < size)
+				addBlock();
 		}
 
-		std::vector<Slot *>	_blocks;
-		Slot				*_freeList;
-		std::size_t			_used;
+// ============================================================================================= //
+
+	private:
+		void	release(TType *ptr)
+		{
+			Slot	*slot;
+
+			slot = reinterpret_cast<Slot *>(ptr);
+			slot->next = freeList;
+			freeList = slot;
+			usedCount--;
+		}
+
+	public:
+		template <typename... TArgs>
+		Object	acquire(TArgs &&... args)
+		{
+			Slot	*slot;
+			Slot	*next;
+			TType	*ptr;
+
+			if (freeList == NULL)
+				addBlock();
+			slot = freeList;
+			next = slot->next;
+			ptr = new (static_cast<void *>(slot->storage)) TType(std::forward<TArgs>(args)...);
+			freeList = next;
+			usedCount++;
+			return (Object(this, ptr));
+		}
+
+		std::size_t	capacity() const { return (blocks.size() * slt); }
+		std::size_t	used() const { return (usedCount); }
+		std::size_t	available() const { return (capacity() - usedCount); }
 };
 
 template <typename TType>
-const std::size_t	Pool<TType>::BLOCK_SIZE;
+const std::size_t	Pool<TType>::slt;
 
 #endif
